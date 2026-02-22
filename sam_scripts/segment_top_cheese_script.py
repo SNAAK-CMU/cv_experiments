@@ -3,6 +3,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cv2 
 
+# # add parent directory two levels above to path so we can import sam2
+# import sys
+# repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+# if repo_root not in sys.path:
+#     sys.path.insert(0, repo_root)
+
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
@@ -20,13 +26,16 @@ CROP_YMIN = 60
 CROP_XMAX = 430
 CROP_YMAX = 280
 
-
-
 def create_sam_predictor():
-    sam2_checkpoint = "../checkpoints/sam2.1_hiera_small.pt"
+    # Use a Hydra-friendly config name (path inside the installed `sam2` package).
+    # Passing an absolute filesystem path as the `config_file` will make Hydra
+    # treat it as a primary config name and fail to locate it. Use the
+    # package-internal path instead (relative to the sam2 package).
+    sam2_checkpoint = "/home/snaak/Documents/Abhi/Vision/sam2/checkpoints/sam2.1_hiera_small.pt"
     model_cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
     sam2_model = build_sam2(model_cfg, sam2_checkpoint, device="cuda")
     predictor = SAM2ImagePredictor(sam2_model)
+    print("SAM predictor created")
     return predictor
 
 
@@ -42,6 +51,12 @@ def segment_top_cheese_2e2(img_name, image, lower_hsv, upper_hsv, predictor):
     mask = segment_from_hsv(cropped_image, lower_hsv, upper_hsv)
     # cv2.imwrite(f"{img_name}_hsvmask.jpg", mask)
     bounding_box = calc_bbox_from_mask(mask)
+
+    # If no bounding box found from HSV mask, skip SAM and return an empty mask
+    if bounding_box is None:
+        print(f"No bounding box found from HSV mask for {img_name}; skipping SAM on cropped image.")
+        # Return an empty mask for the full image so downstream code can handle it
+        return np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
 
     # Run SAM
     predictor.set_image(cropped_image)
@@ -103,26 +118,49 @@ def test_on_dir(dir_path):
 
     predictor = create_sam_predictor()
 
-    image_names = sorted(os.listdir(dir_path))
-    for img_name in image_names:
+    # Walk the directory recursively and process any supported image files.
+    # This preserves subdirectory structure inside the output folder.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    output_root = os.path.join(script_dir, "sam_tests", "cheese_results")
+    supported_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff')
 
-        img_path = os.path.join(dir_path, img_name)
-        image = cv2.imread(img_path)
+    for root, _, files in os.walk(dir_path):
+        for img_name in sorted(files):
+            if not img_name.lower().endswith(supported_exts):
+                continue
 
-        if first_img:
-            first_img = False
-            cropped2_image = image[crop_ymin_hsv:crop_ymax_hsv, crop_xmin_hsv:crop_xmax_hsv]
-            lower_hsv, upper_hsv = get_hsv_range(cropped2_image)
+            img_path = os.path.join(root, img_name)
+            print("Processing", img_path)
+            image = cv2.imread(img_path)
+            if image is None:
+                print(f"Warning: failed to read image {img_path}, skipping")
+                continue
 
-        top_cheese_mask = segment_top_cheese_2e2(img_name, image, lower_hsv, upper_hsv, predictor)
-        top_cheese_mask *= 255
+            if first_img:
+                first_img = False
+                try:
+                    cropped2_image = image[crop_ymin_hsv:crop_ymax_hsv, crop_xmin_hsv:crop_xmax_hsv]
+                    lower_hsv, upper_hsv = get_hsv_range(cropped2_image)
+                except Exception as e:
+                    print(f"Error computing HSV range from first image {img_path}: {e}")
+                    continue
 
-        color = (0, 0, 255)
-        colored_image = np.zeros_like(image)
-        colored_image[:] = color
-        result = np.where(top_cheese_mask[:, :, None] == 255, colored_image, image)
+            top_cheese_mask = segment_top_cheese_2e2(img_name, image, lower_hsv, upper_hsv, predictor)
+            top_cheese_mask *= 255
 
-        cv2.imwrite(f"../../data_collection/results/{img_name.split('.')[0]}_result.jpg", result)
+            color = (0, 0, 255)
+            colored_image = np.zeros_like(image)
+            colored_image[:] = color
+            result = np.where(top_cheese_mask[:, :, None] == 255, colored_image, image)
+
+            # Mirror the input directory structure under the output root
+            rel_path = os.path.relpath(img_path, dir_path)
+            rel_dir = os.path.dirname(rel_path)
+            out_dir = os.path.join(output_root, rel_dir)
+            os.makedirs(out_dir, exist_ok=True)
+            out_name = os.path.splitext(os.path.basename(img_name))[0] + "_result.jpg"
+            out_path = os.path.join(out_dir, out_name)
+            cv2.imwrite(out_path, result)
 
 if __name__ == "__main__":
-    test_on_dir("../../data_collection/cheese_sequence")
+    test_on_dir("/home/snaak/Documents/datasets/testsets/cheese")
